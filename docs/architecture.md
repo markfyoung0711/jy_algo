@@ -200,13 +200,17 @@ jy_algo/
     │   ├── schema.py           # MarketMessage + NormalizedRecord + PyArrow schemas
     │   └── settings.py         # pydantic-settings reading .env
     ├── feeds/
-    │   ├── base.py             # BaseFeed ABC: retry loop, exponential backoff
-    │   ├── crypto_feed.py      # ccxt.pro WebSocket, BTC 1-min OHLCV
-    │   ├── vix_feed.py         # CBOE CDN, 1-sec poll, market hours only
-    │   ├── breakeven_feed.py   # FRED T5YIE, daily post-close, store vintage dates
-    │   ├── gpr_feed.py         # policyuncertainty.com CSV, monthly HTTP GET
-    │   ├── coinglass_feed.py   # REST 1-min, all exchanges, no pre-aggregation
-    │   └── glassnode_feed.py   # REST on-demand, full metric catalogue, 429 backoff
+    │   ├── base.py             # BaseFeed ABC: retry loop, exponential backoff, publish()
+    │   ├── base_rest.py        # RestFeed(BaseFeed): poll interval, HTTP session, rate limit handling
+    │   ├── base_websocket.py   # WebSocketFeed(BaseFeed): connection lifecycle, reconnect, heartbeat
+    │   ├── base_file.py        # FileFeed(BaseFeed): schedule check, HTTP GET, file hash dedup
+    │   │
+    │   ├── crypto_feed.py      # CryptoFeed(WebSocketFeed): ccxt.pro WS, BTC 1-min OHLCV
+    │   ├── vix_feed.py         # VixFeed(RestFeed): CBOE CDN, 1-sec poll, market-hours guard
+    │   ├── breakeven_feed.py   # BreakevenFeed(RestFeed): FRED T5YIE, daily post-close, vintage dates
+    │   ├── gpr_feed.py         # GprFeed(FileFeed): policyuncertainty.com CSV, monthly, hash dedup
+    │   ├── coinglass_feed.py   # CoinglassFeed(RestFeed): 1-min poll, all exchanges, no pre-aggregation
+    │   └── glassnode_feed.py   # GlassnodeFeed(RestFeed): on-demand, full metric catalogue, 429 backoff
     ├── writers/
     │   ├── parquet_writer.py   # raw archive consumer
     │   └── duckdb_writer.py    # normalized store consumer
@@ -215,6 +219,79 @@ jy_algo/
         ├── backfill.py         # one-time historical load per feed
         └── query.py            # python -m jy_algo.scripts.query --feed vix --date 20260311
 ```
+
+---
+
+## Downloader Class Hierarchy
+
+Each feed is its own independent downloader class. They share infrastructure via inheritance but diverge freely — a feed can override any method without affecting others. The hierarchy has three levels:
+
+```
+BaseFeed (ABC)
+├── RestFeed
+│   ├── VixFeed
+│   ├── BreakevenFeed
+│   ├── CoinglassFeed
+│   └── GlassnodeFeed
+├── WebSocketFeed
+│   └── CryptoFeed
+└── FileFeed
+    └── GprFeed
+```
+
+### `BaseFeed` — shared contract
+Owns the run loop, retry logic with exponential backoff, Redis publish, structured error logging, and the `MarketMessage` envelope. Every feed gets these for free.
+
+```python
+class BaseFeed(ABC):
+    async def run(self) -> None: ...         # entry point; calls fetch() in a retry loop
+    async def publish(self, msg) -> None: ...# XADD to Redis Streams
+    @abstractmethod
+    async def fetch(self) -> list[MarketMessage]: ...  # each feed implements this
+    def _backoff(self, attempt: int) -> float: ...     # 5s base, 5min cap
+```
+
+### `RestFeed(BaseFeed)` — polling HTTP sources
+Adds: configurable `poll_interval`, shared `aiohttp.ClientSession`, rate limit handling (respects `Retry-After` headers), and a `should_poll()` hook for time-window guards (e.g. market hours).
+
+```python
+class RestFeed(BaseFeed):
+    poll_interval: int           # seconds between fetches
+    async def should_poll(self) -> bool: ... # override to gate by time/calendar
+    async def get(self, url, **params): ...  # shared session with timeout + retry
+```
+
+**Per-feed specializations:**
+- `VixFeed` — overrides `should_poll()` to return `False` outside 9:30am–4pm ET on trading days
+- `BreakevenFeed` — overrides `should_poll()` for once-daily post-close cadence; `fetch()` preserves FRED vintage dates in payload
+- `CoinglassFeed` — `fetch()` returns one `MarketMessage` per exchange per metric (no pre-aggregation); handles Coinglass pagination
+- `GlassnodeFeed` — `fetch()` iterates the full metric catalogue; overrides `_backoff()` to honor `Retry-After` on 429
+
+### `WebSocketFeed(BaseFeed)` — persistent connection sources
+Adds: connection lifecycle (connect/disconnect/reconnect), heartbeat, message buffering during reconnect, and backpressure handling.
+
+```python
+class WebSocketFeed(BaseFeed):
+    async def connect(self) -> None: ...
+    async def on_message(self, raw) -> list[MarketMessage]: ...  # parse ws frame
+    async def on_disconnect(self) -> None: ...  # triggers reconnect with backoff
+```
+
+**Per-feed specializations:**
+- `CryptoFeed` — uses ccxt.pro's async WebSocket abstraction; subscribes to multiple symbols and timeframes; buffers incomplete OHLCV bars until the bar closes
+
+### `FileFeed(BaseFeed)` — scheduled file downloads
+Adds: schedule checking (run at most once per period), HTTP GET of a remote file, SHA-256 hash deduplication (don't reprocess a file that hasn't changed), and raw file storage alongside the parsed message.
+
+```python
+class FileFeed(BaseFeed):
+    check_interval: int          # how often to check for a new file (seconds)
+    async def is_new(self, url) -> bool: ...   # HEAD request + hash comparison
+    async def download(self, url) -> bytes: ...
+```
+
+**Per-feed specializations:**
+- `GprFeed` — overrides `check_interval` to daily (the monthly CSV rarely changes mid-month); `fetch()` parses CSV, emits one `MarketMessage` per month row; stores raw CSV bytes in payload for archive
 
 ---
 
