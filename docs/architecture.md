@@ -539,6 +539,99 @@ Exchange adapters exist because ccxt normalizes most fields but each exchange ha
 
 ---
 
+## SID Registry (Security Master)
+
+SID is a globally unique, monotonically increasing integer assigned to every instrument the system has ever seen — across all instrument types and all sources. SID 813 might be IBM equity; SID 814 might be a US 30Y Treasury. The pool is undivided: there are no separate sequences per instrument type.
+
+A SID is permanent and never reused. If an instrument is delisted or superseded, its SID remains in the registry with `active = false` and optionally `superseded_by` pointing to the new SID.
+
+### Instrument Types
+
+```
+equity      # IBM, AAPL — primary source: Bloomberg
+bond        # US 30Y Treasury, corporate bonds
+currency    # USD, EUR, GBP — FX pairs
+crypto      # BTC, ETH — primary source: exchange APIs
+future      # ES, NQ, CL — CME product specs
+option      # equity and index options
+```
+
+### SID Registry Schema
+
+```
+reference/sids/registry.parquet   ← append-only; new rows only
+```
+
+```
+sid:              int         # monotonically increasing, globally unique, never reused
+created_at:       timestamp   # when this SID was allocated in our system
+creation_source:  string      # "bloomberg" | "ccxt:binance" | "cme_product" | "manual"
+creation_capture: string      # capturename that triggered SID creation
+instrument_type:  string      # equity | bond | currency | crypto | future | option
+primary_exchange: string      # NYSE | NASDAQ | CME | BINANCE | OKX | etc.
+ticker:           string      # human-readable symbol at time of creation
+name:             string      # full instrument name
+currency:         string      # denomination (USD, USDT, BTC)
+isin:             string|null
+cusip:            string|null
+figi:             string|null
+exchange_native:  string      # exchange's own symbol string at time of creation
+active:           bool        # false if delisted or superseded
+superseded_by:    int|null    # SID of replacement instrument if applicable
+```
+
+### SID Creation Flow
+
+New instruments enter the registry through a dedicated **SID creation capture** — a specific capture event (not a market data feed) that detects a previously unseen instrument and allocates the next SID.
+
+```
+Creation capture detects new instrument
+        │
+        ▼
+Check registry: does a SID already exist for this instrument?
+  (match on: instrument_type + primary_exchange + ticker or ISIN/CUSIP/FIGI)
+        │
+   no match
+        │
+        ▼
+Allocate next SID (MAX(sid) + 1, serialized write)
+Write new row to reference/sids/registry.parquet
+        │
+        ▼
+SID is now available for all captures to reference
+```
+
+Deduplication on write is critical — two simultaneous creation captures for the same instrument must not allocate two SIDs. The writer serializes on a lock file or uses an atomic append mechanism.
+
+### Sources of New SIDs by Instrument Type
+
+| Type | Primary creation source | Trigger |
+|---|---|---|
+| Equity | Bloomberg feed | New listing, IPO |
+| Bond | Bloomberg / FRED | New issuance |
+| Currency | Manual / config | Rarely changes |
+| Crypto | Exchange API (`ccxt load_markets()`) | New token listed on exchange |
+| Future | CME product spec download | New contract listed |
+| Option | Exchange API | New expiry listed |
+
+### Corporate Actions and Crypto Events
+
+Some corporate actions require a **new SID** because the resulting instrument is economically distinct:
+
+| Event | Action |
+|---|---|
+| Stock split (e.g. 2:1) | Same SID; adjustment factor recorded in `reference/corporate_actions/` |
+| Ticker change (e.g. FB → META) | Same SID; new ticker row in history |
+| Merger/acquisition (target delisted) | Target SID: `active=false, superseded_by=acquirer_SID` |
+| Reverse merger (new entity) | New SID allocated |
+| Crypto token redenomination (e.g. LUNA → LUNA2) | Old SID: `active=false, superseded_by=new_SID`; new SID allocated |
+| Crypto chain split / hard fork | New SID for each resulting token |
+| Token burn/relaunch | New SID |
+
+Corporate actions that do **not** create a new SID still generate a capture event recorded in `reference/corporate_actions/{YYYYMMDD}/{epoch_s}.json` with the SID, action type, effective date, and adjustment details.
+
+---
+
 ## Capture Configuration
 
 Each capturename has a configuration file at `config/captures/{capturename}.yaml` that defines its full behavior. Adding a new capture requires only a config file and a class stub — nothing else in the pipeline changes.
