@@ -214,10 +214,41 @@ jy_algo/
     ├── writers/
     │   ├── parquet_writer.py   # raw archive consumer
     │   └── duckdb_writer.py    # normalized store consumer
+    ├── validators/
+    │   ├── base.py             # BaseValidator ABC, ValidationReport, ValidationFailure
+    │   ├── crypto_validator.py
+    │   ├── vix_validator.py
+    │   ├── breakeven_validator.py
+    │   ├── gpr_validator.py
+    │   ├── coinglass_validator.py
+    │   └── glassnode_validator.py
+    ├── reference/
+    │   ├── symbol_registry.py  # SymbolRegistry, SymbolRecord — canonical cross-exchange map
+    │   └── exchange_adapters/
+    │       ├── base.py         # normalize ccxt market dict → SymbolRecord
+    │       ├── binance.py      # Binance-specific quirks
+    │       ├── okx.py
+    │       ├── bybit.py
+    │       └── bitmex.py
     └── scripts/
         ├── run_feed.py         # python -m jy_algo.scripts.run_feed --feed vix
         ├── backfill.py         # one-time historical load per feed
+        ├── validate.py         # python -m jy_algo.scripts.validate --feed vix --date 20260311
+        ├── refresh_symbols.py  # python -m jy_algo.scripts.refresh_symbols --exchange all
         └── query.py            # python -m jy_algo.scripts.query --feed vix --date 20260311
+```
+
+Also update the data directory layout:
+
+```
+data/
+  {feed}/{YYYYMMDD}/{ts_ms}.parquet    # raw archive (append-only)
+  normalized/{YYYYMMDD}/               # normalized time-series
+  validation/{feed}/{YYYYMMDD}/        # validation reports
+  reference/symbols/{exchange}/        # symbol snapshots per exchange per date
+    {YYYYMMDD}.parquet
+    canonical_map.parquet              # latest resolved cross-exchange map
+  redis/                               # Redis AOF persistence
 ```
 
 ---
@@ -240,7 +271,7 @@ BaseFeed (ABC)
 ```
 
 ### `BaseFeed` — shared contract
-Owns the run loop, retry logic with exponential backoff, Redis publish, structured error logging, and the `MarketMessage` envelope. Every feed gets these for free.
+Owns the run loop, retry logic with exponential backoff, Redis publish, structured error logging, and the `MarketMessage` envelope. Every feed gets these for free. **Feeds are responsible only for raw capture — no validation logic lives here.**
 
 ```python
 class BaseFeed(ABC):
@@ -292,6 +323,181 @@ class FileFeed(BaseFeed):
 
 **Per-feed specializations:**
 - `GprFeed` — overrides `check_interval` to daily (the monthly CSV rarely changes mid-month); `fetch()` parses CSV, emits one `MarketMessage` per month row; stores raw CSV bytes in payload for archive
+
+---
+
+## Validation Subsystem
+
+Validation is **orthogonal to capture**. It is a separate service that reads from raw data locations and produces validation reports. It has no coupling to the feed classes — it can be run independently, pointed at any `data/{feed}/{YYYYMMDD}/` path, and re-run at any time without touching the capture pipeline.
+
+```
+data/{feed}/{YYYYMMDD}/     ← raw archive (written by feeds)
+         │
+         │  pointed at by
+         ▼
+  validators/{feed}.py      ← per-feed validator, run independently
+         │
+         ▼
+  data/validation/
+    {feed}/{YYYYMMDD}/
+      report.parquet         ← one row per raw file: valid/invalid + failure details
+```
+
+### Class Design
+
+```python
+class BaseValidator(ABC):
+    feed: str
+
+    def run(self, path: str) -> ValidationReport: ...
+    # reads all parquet files under path, calls check() on each record
+
+    @abstractmethod
+    def check(self, record: dict) -> list[ValidationFailure]: ...
+    # returns empty list if valid; list of failures otherwise
+```
+
+Each feed has its own validator that knows what fields to check:
+
+```python
+class CryptoValidator(BaseValidator):
+    # low <= open, close, high; volume >= 0; ts within expected interval; no nulls
+
+class VixValidator(BaseValidator):
+    # value in range 5–150; ts is today; reject stale (ts unchanged from prior record)
+
+class BreakevenValidator(BaseValidator):
+    # value in range −2% to 10%; vintage_date present and parseable; series_id == "T5YIE"
+
+class GprValidator(BaseValidator):
+    # expected columns present; value > 0; period parseable as YYYYMM; no duplicate months
+
+class CoinglassValidator(BaseValidator):
+    # funding rate in range −1% to 1% per 8h; exchange in known set; open_interest >= 0
+
+class GlassnodeValidator(BaseValidator):
+    # metric name matches request; timestamp aligns to declared resolution; null handling per metric
+```
+
+### `ValidationReport` and `ValidationFailure`
+
+```python
+class ValidationFailure(TypedDict):
+    field:    str       # which field failed
+    rule:     str       # human-readable rule that was violated
+    value:    Any       # the actual value that failed
+    severity: str       # "error" | "warning"
+
+class ValidationReport(TypedDict):
+    feed:          str
+    path:          str          # the data path that was validated
+    run_ts:        int          # when validation ran (unix ms)
+    total:         int          # records checked
+    valid:         int
+    invalid:       int
+    failures:      list[ValidationFailure]
+```
+
+Reports are written to `data/validation/{feed}/{YYYYMMDD}/report.parquet` and queryable via DuckDB alongside raw and normalized data.
+
+### Module Location
+
+```
+jy_algo/
+└── validators/
+    ├── base.py              # BaseValidator ABC, ValidationReport, ValidationFailure
+    ├── crypto_validator.py
+    ├── vix_validator.py
+    ├── breakeven_validator.py
+    ├── gpr_validator.py
+    ├── coinglass_validator.py
+    └── glassnode_validator.py
+```
+
+Run independently:
+```bash
+python -m jy_algo.scripts.validate --feed vix --date 20260311
+python -m jy_algo.scripts.validate --feed coinglass --date 20260311 --path data/coinglass/20260311
+```
+
+---
+
+## Symbol Reference Data Subsystem
+
+Crypto exchanges each use different naming conventions for the same instrument (`BTC/USDT` on Binance, `BTC-USDT` on OKX, `XBTUSD` on BitMEX). The symbol reference subsystem downloads and maintains a canonical symbol map per exchange, used by `CryptoFeed` and `CoinglassFeed` to resolve instruments at startup and during subscription changes.
+
+This is **reference data**, not time-series data — it has a different lifecycle (refresh daily or on-demand, not streamed) and lives in its own storage separate from the capture pipeline.
+
+### Storage
+
+```
+data/
+  reference/
+    symbols/
+      {exchange}/
+        {YYYYMMDD}.parquet     # full symbol list as of that date
+      canonical_map.parquet    # latest resolved cross-exchange symbol map
+```
+
+### Class Design
+
+```python
+class SymbolRegistry:
+    """
+    Downloads and caches the full instrument list per exchange.
+    Feeds call registry.resolve(canonical, exchange) to get the
+    exchange-native symbol string before subscribing.
+    """
+
+    async def refresh(self, exchange: str) -> None: ...
+    # fetches exchange.load_markets() via ccxt, writes to data/reference/symbols/{exchange}/{date}.parquet
+
+    def resolve(self, canonical: str, exchange: str) -> str: ...
+    # e.g. resolve("BTC/USDT", "okx") → "BTC-USDT"
+    # raises UnknownSymbolError if not found
+
+    def list_exchanges(self) -> list[str]: ...
+    def list_symbols(self, exchange: str) -> list[SymbolRecord]: ...
+```
+
+```python
+class SymbolRecord(TypedDict):
+    canonical:     str    # normalized form: "BTC/USDT"
+    exchange:      str    # "binance" | "okx" | "bybit" | "bitmex" | ...
+    native:        str    # exchange's own symbol string
+    base:          str    # "BTC"
+    quote:         str    # "USDT"
+    active:        bool   # whether the exchange currently lists this instrument
+    type:          str    # "spot" | "future" | "perp" | "option"
+    settle:        str | None   # settlement currency for derivatives
+    expiry:        str | None   # ISO date for dated futures; None for perps
+    fetched_date:  str    # YYYYMMDD when this record was downloaded
+```
+
+### Refresh Strategy
+
+- **At startup**: `CryptoFeed` and `CoinglassFeed` call `registry.refresh(exchange)` if the cached file is older than 24 hours, then call `registry.resolve()` to build their subscription list.
+- **Daily**: a scheduled `scripts/refresh_symbols.py` run refreshes all configured exchanges and writes a new dated snapshot. Historical snapshots are preserved — instruments get listed and delisted, and you may need to know what was tradeable on a given date for backtesting.
+- **On-demand**: `python -m jy_algo.scripts.refresh_symbols --exchange binance`
+
+### Module Location
+
+```
+jy_algo/
+├── reference/
+│   ├── __init__.py
+│   ├── symbol_registry.py     # SymbolRegistry, SymbolRecord
+│   └── exchange_adapters/
+│       ├── base.py            # BaseExchangeAdapter: normalize ccxt market dict → SymbolRecord
+│       ├── binance.py         # BinanceAdapter: handle Binance-specific quirks
+│       ├── okx.py
+│       ├── bybit.py
+│       └── bitmex.py
+└── scripts/
+    └── refresh_symbols.py     # python -m jy_algo.scripts.refresh_symbols --exchange all
+```
+
+Exchange adapters exist because ccxt normalizes most fields but each exchange has quirks in how it represents perpetuals, quanto contracts, and coin-margined instruments that need per-exchange handling.
 
 ---
 
