@@ -43,7 +43,7 @@ Data moves forward through three zones. It never moves backward. Each zone trans
 └─────────────────────────────────────────────┘
       │
       ▼
-[Analysis: correlation, backtesting, dashboards]
+[Consumed by trading/analysis repo via Parquet reads]
 ```
 
 ---

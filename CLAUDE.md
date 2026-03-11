@@ -4,7 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**jy_algo** is an early-stage algorithmic trading/analysis project focused on Bitcoin market dynamics, geopolitical risk factors, and macroeconomic correlation analysis. The repository currently contains research documentation but no implemented code yet.
+**jy_algo** is the market data collection repository for the jy trading system. Its sole responsibility is capturing, validating, and storing raw market data across multiple feeds. Trading logic, analysis, and correlation models live in a separate repository.
+
+**Scope of this repo:**
+- Feed producers (crypto, VIX, breakeven, GPR, Coinglass, Glassnode)
+- Symbol reference data ETL
+- Raw → staged → warehouse zone pipeline
+- Validation subsystem
+- Message bus (Redis Streams) and Parquet storage
+
+**Out of scope:** backtesting, order execution, correlation models, dashboards, trading strategies.
 
 ## Design Documentation
 
