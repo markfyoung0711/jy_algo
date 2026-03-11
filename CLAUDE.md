@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **jy_algo** is an early-stage algorithmic trading/analysis project focused on Bitcoin market dynamics, geopolitical risk factors, and macroeconomic correlation analysis. The repository currently contains research documentation but no implemented code yet.
 
+## Design Documentation
+
+Full pipeline architecture, ETL design decisions, message schema, and phased implementation plan: [`docs/architecture.md`](docs/architecture.md)
+
 ## Commands
 
 **Python**
