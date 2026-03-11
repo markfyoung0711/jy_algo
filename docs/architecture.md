@@ -12,21 +12,24 @@ Data moves forward through three zones. It never moves backward. Each zone trans
 [APIs / Files]
       │
       ▼
-┌─────────────────────────────────────────────┐
-│  raw/<feedname>/{YYYYMMDD}/{ts_ms}.parquet  │  Immutable. Exactly what the source returned.
-│  (append-only, never modified)              │  No transformation. No validation.
-└───────────────────┬─────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  raw/<capturename>/{YYYYMMDD}/{epoch_s}.<ext>    │  Exact bytes from source.
+│  (append-only, never modified)                       │  Native format: .json, .csv,
+│                                                      │  .bin, .pb, .xml — whatever
+│                                                      │  the source delivers. No conversion.
+└───────────────────┬──────────────────────────────────┘
                     │
           field/format validation
-          (per-feed validator: types, ranges,
-           required fields, timestamp sanity)
+          (per-feed validator: parse raw bytes,
+           check types, ranges, required fields,
+           timestamp sanity)
                     │
-            pass ──┘──── fail → validation/<feedname>/failures/
+            pass ──┘──── fail → validation/<capturename>/failures/
                     │
-                    ▼
+                    ▼  convert to Parquet here
 ┌─────────────────────────────────────────────┐
-│  staged/<feedname>/{YYYYMMDD}/{ts_ms}.parquet│  Validated raw. Safe to process.
-│                                             │  Same schema as raw — no transformation yet.
+│  staged/<capturename>/{YYYYMMDD}/       │  Parquet. First structured form.
+│  {epoch_s}.parquet                          │  Schema enforced. Safe to process.
 └───────────────────┬─────────────────────────┘
                     │
           business rule validation
@@ -34,16 +37,18 @@ Data moves forward through three zones. It never moves backward. Each zone trans
            timestamp alignment, unit sanity,
            duplicate detection)
                     │
-            pass ──┘──── fail → validation/<feedname>/rejected/
+            pass ──┘──── fail → validation/<capturename>/rejected/
                     │
-                    ▼
+                    ▼  load into Iceberg
 ┌─────────────────────────────────────────────┐
-│  warehouse/<feedname>/{YYYYMMDD}/           │  Analysis-ready. Normalized, aligned,
-│                                             │  z-scored, outlier-tagged.
+│  warehouse/<capturename>/               │  Apache Iceberg tables.
+│  (Iceberg table, Parquet + snapshots)       │  Bi-temporal: snapshot = transaction time,
+│                                             │  valid_from/valid_to = valid time.
+│                                             │  Normalized, z-scored, outlier-tagged.
 └─────────────────────────────────────────────┘
       │
       ▼
-[Consumed by trading/analysis repo via Parquet reads]
+[Consumed by trading/analysis repo]
 ```
 
 ---
@@ -66,23 +71,26 @@ Data moves forward through three zones. It never moves backward. Each zone trans
 ### Raw Storage Path Convention
 
 ```
-data/
-  {feed_name}/
+raw/
+  {capturename}/
     {YYYYMMDD}/
-      {unix_ms}.parquet        # one file per capture event
+      {unix_epoch_s}.{ext}     # native format — exact bytes from source
 ```
 
-Examples:
-```
-raw/vix/20260311/1741651201000.parquet
-raw/coinglass/20260311/1741651260000.parquet
-raw/gpr/20260301/1741651200000.parquet
-raw/breakeven/20260311/1741694400000.parquet
-```
+The file extension reflects the actual format delivered by the source:
+
+| Source | Format | Example path |
+|---|---|---|
+| CBOE VIX | JSON | `raw/cboe_vix/20260311/1741651201.json` |
+| FRED breakeven | JSON | `raw/fred_breakeven/20260311/1741694400.json` |
+| GPR Index | CSV | `raw/gpr_index/20260301/1741651200.csv` |
+| Coinglass funding rates | JSON | `raw/coinglass_funding_rates/20260311/1741651260.json` |
+| Coinglass open interest | JSON | `raw/coinglass_open_interest/20260311/1741651260.json` |
+| Binance OHLCV | Binary | `raw/binance_btcusdt_ohlcv/20260311/1741651260.bin` |
 
 ### Redis Streams as the Capture Buffer
 
-Producers publish to `market:{feed_name}` streams. Consumer groups allow the Parquet writer and DuckDB writer to consume independently without coupling. Redis `MAXLEN ~604800` (≈7 days at 1/sec) bounds memory. `noeviction` policy is critical — Redis must not silently drop messages.
+Producers publish to `market:{capturename}` streams. Consumer groups allow the Parquet writer and DuckDB writer to consume independently without coupling. Redis `MAXLEN ~604800` (≈7 days at 1/sec) bounds memory. `noeviction` policy is critical — Redis must not silently drop messages.
 
 ```
 market:crypto      market:vix      market:breakeven
@@ -159,9 +167,9 @@ Two separate stores — never mix them:
 
 | Store | Purpose | Format | Mutation policy |
 |---|---|---|---|
-| **raw/** | Faithful capture of every API response | Parquet (`raw/{feed}/{YYYYMMDD}/{unix_epoch_s}.parquet`) | Append-only, never modified |
-| **staged/** | Passed field/format validation | Parquet (`staged/{feed}/{YYYYMMDD}/{unix_epoch_s}.parquet`) | Written by validator, never modified |
-| **warehouse/** | Passed all business rule validation | Parquet (`warehouse/{feed}/{YYYYMMDD}/`) | Normalized, z-scored, aligned |
+| **raw/** | Exact bytes from source | Native format (`raw/{capturename}/{YYYYMMDD}/{unix_epoch_s}.{ext}`) | Append-only, never modified |
+| **staged/** | Passed field/format validation | Parquet (`staged/{capturename}/{YYYYMMDD}/{unix_epoch_s}.parquet`) | Written by validator, never modified |
+| **warehouse/** | Passed all business rule validation | Apache Iceberg (`warehouse/{capturename}/`) | Bi-temporal, normalized, z-scored |
 
 All three zones use the same Parquet file convention and can be queried by any compatible tool (DuckDB, Pandas, Polars, Spark, etc.). The database backend for the warehouse is TBD — Parquet is the portable interchange format regardless of what sits on top.
 
@@ -179,7 +187,7 @@ All three zones use the same Parquet file convention and can be queried by any c
                            │ XADD
                            ▼
 ┌──────────────────────────────────────────────────────────┐
-│          Redis Streams  (market:{feed_name})             │
+│          Redis Streams  (market:{capturename})             │
 │          Consumer groups: raw-writer, norm-writer        │
 │          MAXLEN ~604800 (7-day rolling window)           │
 └──────────┬───────────────────────────┬───────────────────┘
@@ -189,7 +197,7 @@ All three zones use the same Parquet file convention and can be queried by any c
   │  parquet_writer │        │  normalizer +        │
   │  → raw/         │        │  duckdb_writer       │
   │                 │        │  → warehouse/        │
-  │  raw/{feed}/    │        │  jy_algo.duckdb      │
+  │  raw/{capturename}/    │        │  jy_algo.duckdb      │
   │  {YYYYMMDD}/    │        │                      │
   │  {epoch_s}.parq │        │                      │
   └─────────────────┘        └──────────────────────┘
@@ -258,18 +266,18 @@ Directory layout:
 
 ```
 raw/
-  {feed}/{YYYYMMDD}/{unix_epoch_s}.parquet    # zone 1: immutable captures
+  {capturename}/{YYYYMMDD}/{unix_epoch_s}.parquet    # zone 1: immutable captures
 
 staged/
-  {feed}/{YYYYMMDD}/{unix_epoch_s}.parquet    # zone 2: passed field/format validation
+  {capturename}/{YYYYMMDD}/{unix_epoch_s}.parquet    # zone 2: passed field/format validation
 
 warehouse/
-  {feed}/{YYYYMMDD}/                          # zone 3: passed all validations, normalized
+  {capturename}/{YYYYMMDD}/                          # zone 3: passed all validations, normalized
 
 validation/
-  {feed}/{YYYYMMDD}/report.parquet            # validation run results
-  {feed}/failures/{YYYYMMDD}/                 # records that failed field/format (raw→staged)
-  {feed}/rejected/{YYYYMMDD}/                 # records that failed business rules (staged→warehouse)
+  {capturename}/{YYYYMMDD}/report.parquet            # validation run results
+  {capturename}/failures/{YYYYMMDD}/                 # records that failed field/format (raw→staged)
+  {capturename}/rejected/{YYYYMMDD}/                 # records that failed business rules (staged→warehouse)
 
 reference/
   symbols/{exchange}/{YYYYMMDD}.parquet       # symbol snapshots per exchange
@@ -353,24 +361,24 @@ class FileFeed(BaseFeed):
 
 ## Validation Subsystem
 
-Validation is **orthogonal to capture**. It is a separate service that reads from raw data locations and produces validation reports. It has no coupling to the feed classes — it can be run independently, pointed at any `data/{feed}/{YYYYMMDD}/` path, and re-run at any time without touching the capture pipeline.
+Validation is **orthogonal to capture**. It is a separate service that reads from raw data locations and produces validation reports. It has no coupling to the feed classes — it can be run independently, pointed at any `data/{capturename}/{YYYYMMDD}/` path, and re-run at any time without touching the capture pipeline.
 
 ```
-raw/{feed}/{YYYYMMDD}/      ← written by feeds (zone 1)
+raw/{capturename}/{YYYYMMDD}/      ← written by feeds (zone 1)
          │
          │  pointed at by
          ▼
   validators/{feed}.py      ← per-feed validator, runs independently
          │
-         ├── pass → staged/{feed}/{YYYYMMDD}/
-         └── fail → validation/{feed}/failures/{YYYYMMDD}/
+         ├── pass → staged/{capturename}/{YYYYMMDD}/
+         └── fail → validation/{capturename}/failures/{YYYYMMDD}/
 
-staged/{feed}/{YYYYMMDD}/   ← zone 2; validator runs again for business rules
+staged/{capturename}/{YYYYMMDD}/   ← zone 2; validator runs again for business rules
          │
-         ├── pass → warehouse/{feed}/{YYYYMMDD}/
-         └── fail → validation/{feed}/rejected/{YYYYMMDD}/
+         ├── pass → warehouse/{capturename}/{YYYYMMDD}/
+         └── fail → validation/{capturename}/rejected/{YYYYMMDD}/
 
-validation/{feed}/{YYYYMMDD}/report.parquet  ← one row per file checked
+validation/{capturename}/{YYYYMMDD}/report.parquet  ← one row per file checked
 ```
 
 ### Class Design
@@ -428,7 +436,7 @@ class ValidationReport(TypedDict):
     failures:      list[ValidationFailure]
 ```
 
-Reports are written to `validation/{feed}/{YYYYMMDD}/report.parquet` and queryable alongside zone data.
+Reports are written to `validation/{capturename}/{YYYYMMDD}/report.parquet` and queryable alongside zone data.
 
 ### Module Location
 
