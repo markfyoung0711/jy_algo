@@ -539,6 +539,86 @@ Exchange adapters exist because ccxt normalizes most fields but each exchange ha
 
 ---
 
+## Capture Configuration
+
+Each capturename has a configuration file at `config/captures/{capturename}.yaml` that defines its full behavior. Adding a new capture requires only a config file and a class stub — nothing else in the pipeline changes.
+
+```yaml
+# config/captures/cboe_vix.yaml
+capturename:      cboe_vix
+method:           rest_poll
+url:              https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_VIX.json
+poll_interval_s:  1
+format:           json
+
+timezone:         America/New_York
+trading_calendar: NYSE               # crypto_247 | NYSE | CME | null (always open)
+market_hours:     ["09:30", "16:00"] # local tz; null = 24h
+expected_absences: [weekend, us_holiday]
+absence_policy:   expected           # expected | alert | retry
+```
+
+```yaml
+# config/captures/coinglass_funding_rates.yaml
+capturename:      coinglass_funding_rates
+method:           rest_poll
+url:              https://open-api.coinglass.com/public/v2/funding
+poll_interval_s:  60
+format:           json
+
+timezone:         UTC
+trading_calendar: crypto_247
+market_hours:     null
+expected_absences: []
+absence_policy:   alert
+```
+
+**`absence_policy` values:**
+- `expected` — no alert if data is absent on a non-trading day
+- `alert` — flag even expected absences (e.g. confirm GPR was actually published)
+- `retry` — keep retrying until data arrives (e.g. FRED sometimes posts late)
+
+Trading calendars are maintained in `config/calendars/` as lists of holidays per calendar name. Crypto captures use `crypto_247` which has no holidays.
+
+---
+
+## Override Ledger
+
+When a vendor delivers incorrect data that they will never correct, overrides can be declared and auto-applied whenever the ETL pipeline is rerun. Overrides are stored as an append-only Parquet file — never mutated, new corrections are new rows.
+
+**Location:** `reference/overrides/overrides.parquet`
+
+**Schema (tall format — one row per field correction):**
+
+```
+sid           string    # Symbol ID of the affected instrument
+capturename   string    # which capture source
+valid_from    date      # start of affected period (valid time, inclusive)
+valid_to      date      # end of affected period (valid time, inclusive)
+field_name    string    # which field to replace
+bad_value     string    # original vendor value (preserved for audit)
+good_value    string    # corrected value to apply
+reason        string    # human explanation
+created_at    timestamp # when this override was entered
+```
+
+Multiple field corrections for the same SID/date range are multiple rows. The ETL join at staged → warehouse:
+
+```sql
+SELECT s.*, o.field_name, o.good_value, o.bad_value
+FROM staged/{capturename} s
+LEFT JOIN reference/overrides/overrides.parquet o
+  ON  s.sid        = o.sid
+  AND s.capturename = o.capturename
+  AND s.ts BETWEEN o.valid_from AND o.valid_to
+```
+
+Warehouse records carry `is_overridden: bool` and retain `bad_value` alongside the corrected `value` for full auditability.
+
+**GUI:** A Streamlit app (`tools/override_gui.py`) provides search by capturename + date, view existing overrides for a SID, and append new corrections. See Task #5.
+
+---
+
 ## Phased Implementation
 
 ### Phase 1 — Foundation + Crypto + VIX (Weeks 1–2)
