@@ -4,30 +4,46 @@ This is a classic ETL (Extract, Transform, Load) pipeline. The design decisions 
 
 ---
 
-## The Three Stages
+## Data Zones
+
+Data moves forward through three zones. It never moves backward. Each zone transition is gated by a validation pass.
 
 ```
 [APIs / Files]
       │
       ▼
-[Raw Capture]  ──────────────────────────────────► [Raw Archive]
- Poll on schedule                                   (immutable,
- Store full response                                append-only)
- Tag with capture time
+┌─────────────────────────────────────────────┐
+│  raw/<feedname>/{YYYYMMDD}/{ts_ms}.parquet  │  Immutable. Exactly what the source returned.
+│  (append-only, never modified)              │  No transformation. No validation.
+└───────────────────┬─────────────────────────┘
+                    │
+          field/format validation
+          (per-feed validator: types, ranges,
+           required fields, timestamp sanity)
+                    │
+            pass ──┘──── fail → validation/<feedname>/failures/
+                    │
+                    ▼
+┌─────────────────────────────────────────────┐
+│  staged/<feedname>/{YYYYMMDD}/{ts_ms}.parquet│  Validated raw. Safe to process.
+│                                             │  Same schema as raw — no transformation yet.
+└───────────────────┬─────────────────────────┘
+                    │
+          business rule validation
+          (cross-feed consistency, outlier flagging,
+           timestamp alignment, unit sanity,
+           duplicate detection)
+                    │
+            pass ──┘──── fail → validation/<feedname>/rejected/
+                    │
+                    ▼
+┌─────────────────────────────────────────────┐
+│  warehouse/<feedname>/{YYYYMMDD}/           │  Analysis-ready. Normalized, aligned,
+│                                             │  z-scored, outlier-tagged.
+└─────────────────────────────────────────────┘
       │
       ▼
-[Normalization]
- Align timestamps
- Handle missing values (tag, don't silently fill)
- Convert units — keep native AND z-scored
- Flag outliers (3σ from 90-day rolling mean)
- Attach source metadata
-      │
-      ▼
-[Normalized Store]  ──────────────────────────────► [Analysis]
- One row per metric per day                          Correlation
- z-scored copy alongside native units                Backtesting
-                                                     Dashboards
+[Analysis: correlation, backtesting, dashboards]
 ```
 
 ---
@@ -58,10 +74,10 @@ data/
 
 Examples:
 ```
-data/vix/20260311/1741651201000.parquet
-data/coinglass/20260311/1741651260000.parquet
-data/gpr/202603/20260301.parquet           # monthly: YYYYMM directory
-data/breakeven/20260311/1741694400000.parquet
+raw/vix/20260311/1741651201000.parquet
+raw/coinglass/20260311/1741651260000.parquet
+raw/gpr/20260301/1741651200000.parquet
+raw/breakeven/20260311/1741694400000.parquet
 ```
 
 ### Redis Streams as the Capture Buffer
@@ -143,12 +159,11 @@ Two separate stores — never mix them:
 
 | Store | Purpose | Format | Mutation policy |
 |---|---|---|---|
-| **Raw archive** | Faithful capture of every API response | Parquet (`data/{feed}/{YYYYMMDD}/{ts_ms}.parquet`) | Append-only, never modified |
-| **Normalized store** | Clean, aligned, analysis-ready time series | DuckDB + Parquet (`data/normalized/{YYYYMMDD}/`) | Rebuilt from raw on schema changes |
+| **raw/** | Faithful capture of every API response | Parquet (`raw/{feed}/{YYYYMMDD}/{unix_epoch_s}.parquet`) | Append-only, never modified |
+| **staged/** | Passed field/format validation | Parquet (`staged/{feed}/{YYYYMMDD}/{unix_epoch_s}.parquet`) | Written by validator, never modified |
+| **warehouse/** | Passed all business rule validation | Parquet (`warehouse/{feed}/{YYYYMMDD}/`) | Normalized, z-scored, aligned |
 
-DuckDB queries both stores in-place via `read_parquet('data/vix/20260311/*.parquet')` — no import step needed.
-
-For production scale: TimescaleDB as a third sink via a second consumer group on Redis Streams.
+All three zones use the same Parquet file convention and can be queried by any compatible tool (DuckDB, Pandas, Polars, Spark, etc.). The database backend for the warehouse is TBD — Parquet is the portable interchange format regardless of what sits on top.
 
 ---
 
@@ -172,11 +187,11 @@ For production scale: TimescaleDB as a third sink via a second consumer group on
            ▼                           ▼
   ┌─────────────────┐        ┌──────────────────────┐
   │  parquet_writer │        │  normalizer +        │
-  │  (raw archive)  │        │  duckdb_writer       │
-  │                 │        │                      │
-  │  data/{feed}/   │        │  data/normalized/    │
-  │  {YYYYMMDD}/    │        │  jy_algo.duckdb      │
-  │  {ts_ms}.parquet│        │                      │
+  │  → raw/         │        │  duckdb_writer       │
+  │                 │        │  → warehouse/        │
+  │  raw/{feed}/    │        │  jy_algo.duckdb      │
+  │  {YYYYMMDD}/    │        │                      │
+  │  {epoch_s}.parq │        │                      │
   └─────────────────┘        └──────────────────────┘
 ```
 
@@ -189,10 +204,12 @@ jy_algo/
 ├── pyproject.toml              # redis>=5, pyarrow, duckdb, pydantic-settings
 ├── docker-compose.yml          # Redis only (redis:7-alpine, appendonly yes, noeviction)
 ├── Makefile
-├── data/                       # gitignored
-│   ├── {feed}/{YYYYMMDD}/      # raw parquet by capture event
-│   ├── normalized/             # normalized parquet
-│   └── redis/                  # Redis AOF persistence
+├── raw/                        # gitignored — zone 1: immutable captures
+├── staged/                     # gitignored — zone 2: field-validated
+├── warehouse/                  # gitignored — zone 3: business-rule validated, normalized
+├── validation/                 # gitignored — validation reports and failure records
+├── reference/                  # gitignored — symbol reference snapshots
+├── redis-data/                 # gitignored — Redis AOF persistence
 ├── rs/                         # Rust crate — Phase 3 L2 order book normalizer
 └── jy_algo/
     ├── core/
@@ -212,8 +229,7 @@ jy_algo/
     │   ├── coinglass_feed.py   # CoinglassFeed(RestFeed): 1-min poll, all exchanges, no pre-aggregation
     │   └── glassnode_feed.py   # GlassnodeFeed(RestFeed): on-demand, full metric catalogue, 429 backoff
     ├── writers/
-    │   ├── parquet_writer.py   # raw archive consumer
-    │   └── duckdb_writer.py    # normalized store consumer
+    │   └── parquet_writer.py   # raw zone writer (consumer of Redis Streams)
     ├── validators/
     │   ├── base.py             # BaseValidator ABC, ValidationReport, ValidationFailure
     │   ├── crypto_validator.py
@@ -238,17 +254,26 @@ jy_algo/
         └── query.py            # python -m jy_algo.scripts.query --feed vix --date 20260311
 ```
 
-Also update the data directory layout:
+Directory layout:
 
 ```
-data/
-  {feed}/{YYYYMMDD}/{ts_ms}.parquet    # raw archive (append-only)
-  normalized/{YYYYMMDD}/               # normalized time-series
-  validation/{feed}/{YYYYMMDD}/        # validation reports
-  reference/symbols/{exchange}/        # symbol snapshots per exchange per date
-    {YYYYMMDD}.parquet
-    canonical_map.parquet              # latest resolved cross-exchange map
-  redis/                               # Redis AOF persistence
+raw/
+  {feed}/{YYYYMMDD}/{unix_epoch_s}.parquet    # zone 1: immutable captures
+
+staged/
+  {feed}/{YYYYMMDD}/{unix_epoch_s}.parquet    # zone 2: passed field/format validation
+
+warehouse/
+  {feed}/{YYYYMMDD}/                          # zone 3: passed all validations, normalized
+
+validation/
+  {feed}/{YYYYMMDD}/report.parquet            # validation run results
+  {feed}/failures/{YYYYMMDD}/                 # records that failed field/format (raw→staged)
+  {feed}/rejected/{YYYYMMDD}/                 # records that failed business rules (staged→warehouse)
+
+reference/
+  symbols/{exchange}/{YYYYMMDD}.parquet       # symbol snapshots per exchange
+  symbols/canonical_map.parquet               # latest cross-exchange map
 ```
 
 ---
@@ -331,16 +356,21 @@ class FileFeed(BaseFeed):
 Validation is **orthogonal to capture**. It is a separate service that reads from raw data locations and produces validation reports. It has no coupling to the feed classes — it can be run independently, pointed at any `data/{feed}/{YYYYMMDD}/` path, and re-run at any time without touching the capture pipeline.
 
 ```
-data/{feed}/{YYYYMMDD}/     ← raw archive (written by feeds)
+raw/{feed}/{YYYYMMDD}/      ← written by feeds (zone 1)
          │
          │  pointed at by
          ▼
-  validators/{feed}.py      ← per-feed validator, run independently
+  validators/{feed}.py      ← per-feed validator, runs independently
          │
-         ▼
-  data/validation/
-    {feed}/{YYYYMMDD}/
-      report.parquet         ← one row per raw file: valid/invalid + failure details
+         ├── pass → staged/{feed}/{YYYYMMDD}/
+         └── fail → validation/{feed}/failures/{YYYYMMDD}/
+
+staged/{feed}/{YYYYMMDD}/   ← zone 2; validator runs again for business rules
+         │
+         ├── pass → warehouse/{feed}/{YYYYMMDD}/
+         └── fail → validation/{feed}/rejected/{YYYYMMDD}/
+
+validation/{feed}/{YYYYMMDD}/report.parquet  ← one row per file checked
 ```
 
 ### Class Design
@@ -370,7 +400,7 @@ class BreakevenValidator(BaseValidator):
     # value in range −2% to 10%; vintage_date present and parseable; series_id == "T5YIE"
 
 class GprValidator(BaseValidator):
-    # expected columns present; value > 0; period parseable as YYYYMM; no duplicate months
+    # expected columns present; value > 0; period is a valid month; no duplicate months in one file
 
 class CoinglassValidator(BaseValidator):
     # funding rate in range −1% to 1% per 8h; exchange in known set; open_interest >= 0
@@ -398,7 +428,7 @@ class ValidationReport(TypedDict):
     failures:      list[ValidationFailure]
 ```
 
-Reports are written to `data/validation/{feed}/{YYYYMMDD}/report.parquet` and queryable via DuckDB alongside raw and normalized data.
+Reports are written to `validation/{feed}/{YYYYMMDD}/report.parquet` and queryable alongside zone data.
 
 ### Module Location
 
@@ -417,7 +447,7 @@ jy_algo/
 Run independently:
 ```bash
 python -m jy_algo.scripts.validate --feed vix --date 20260311
-python -m jy_algo.scripts.validate --feed coinglass --date 20260311 --path data/coinglass/20260311
+python -m jy_algo.scripts.validate --feed coinglass --date 20260311 --path raw/coinglass/20260311
 ```
 
 ---
@@ -450,7 +480,7 @@ class SymbolRegistry:
     """
 
     async def refresh(self, exchange: str) -> None: ...
-    # fetches exchange.load_markets() via ccxt, writes to data/reference/symbols/{exchange}/{date}.parquet
+    # fetches exchange.load_markets() via ccxt, writes to reference/symbols/{exchange}/{date}.parquet
 
     def resolve(self, canonical: str, exchange: str) -> str: ...
     # e.g. resolve("BTC/USDT", "okx") → "BTC-USDT"
