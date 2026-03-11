@@ -1,0 +1,21 @@
+[project]
+name = "jy-algo"
+version = "0.1.0"
+description = "BTC algorithmic trading and analysis"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas",
+    "numpy",
+    "requests",
+    "python-dotenv",
+    "ccxt",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

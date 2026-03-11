@@ -6,9 +6,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **jy_algo** is an early-stage algorithmic trading/analysis project focused on Bitcoin market dynamics, geopolitical risk factors, and macroeconomic correlation analysis. The repository currently contains research documentation but no implemented code yet.
 
+## Commands
+
+**Python**
+```bash
+source .venv/bin/activate       # activate virtualenv
+uv pip install -e ".[dev]"      # install/sync dependencies
+pytest                          # run tests
+ruff check .                    # lint
+```
+
+**Rust**
+```bash
+source ~/.cargo/env             # make cargo available (new shells)
+cd rs && cargo build            # build
+cd rs && cargo test             # run tests
+cd rs && cargo run              # run binary
+```
+
+## Project Structure
+
+```
+jy_algo/
+├── pyproject.toml      # Python project config + deps
+├── rs/                 # Rust crate (jy-algo-rs)
+│   ├── Cargo.toml
+│   └── src/main.rs
+├── .env                # API keys (not committed)
+└── .env.example        # API key template
+```
+
+Python virtualenv is at `.venv/`. The Rust toolchain is managed via rustup (`~/.cargo/`).
+
 ## Repository State
 
-This is a newly initialized repository with no build system, dependencies, or code structure established yet. The primary file is `btc-iran-session.md`, a research document covering:
+The primary research reference is `btc-iran-session.md`, covering:
 
 - BTC price correlation with geopolitical events (Iran conflict timeline)
 - BTC vs. US 5Y Bond yield correlation
